@@ -1,0 +1,13 @@
+# フォルダ
+venv/
+__pycache__/
+build/
+dist/
+
+
+# ファイル
+*rakuten.xlsx
+save.json
+main.spec
+requirements.txt
+sub2.py
