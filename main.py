@@ -11,6 +11,7 @@ class TradingApp:
         self.root = root
         self.root.title("半自動売却サポートツール")
         self.data = {}
+        self.sheets = None
 
         self.create_widgets()
 
@@ -33,9 +34,9 @@ class TradingApp:
                  anchor=tk.W).pack(fill=tk.X, padx=8)
 
         columns = (
-            "適用*", "銘柄コード", "銘柄名", "取得日*",
-            "現在値", "最新の終値", "最新の5日sma", "直近高値", "ルール%参考値",
-            "高値ルール%*", "売却提案", "売却理由", "売却数量"
+            "適用*", "銘柄コード", "口座区分", "銘柄名", "取得日*",
+            "現在値", "最新の終値", "最新の5日sma", "直近高値", "参考 %",
+            "高値用 %*", "売却提案*", "売却理由", "売却数量*"
         )
 
         tree_frame = tk.Frame(self.root)
@@ -43,9 +44,9 @@ class TradingApp:
 
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings")
         col_widths = {
-            "適用*": 40, "銘柄コード": 70, "銘柄名": 120, "取得日*": 130,
-            "現在値": 70, "最新の終値": 80, "最新の5日sma": 80, "直近高値": 90, "ルール%参考値":100,
-            "高値ルール%*": 80, "売却提案": 100, "売却理由": 70, "売却数量": 90,
+            "適用*": 40, "銘柄コード": 70, "口座区分": 70, "銘柄名": 120, "取得日*": 130,
+            "現在値": 70, "最新の終値": 80, "最新の5日sma": 80, "直近高値": 90, "参考 %":80,
+            "高値用 %*": 80, "売却提案*": 100, "売却理由": 70, "売却数量*": 90,
         }
         for col in columns:
             self.tree.heading(col, text=col)
@@ -102,6 +103,36 @@ class TradingApp:
             return f"｢{_GET_DATE_HINT}｣"
         return f"｢{get_date}｣"
 
+    @staticmethod
+    def _find_stock(row_data):
+        # 現物：code+account_classで個別のStockを特定。信用：code単位のcredit_stocks_code（集約）を返す
+        if row_data["stock_type"] == "spot":
+            for s in sub1.spot_stocks.get(row_data["code"], []):
+                if s.account_class == row_data["account_class"]:
+                    return s
+            return None
+        return sub1.credit_stocks_code.get(row_data["code"])
+
+    @staticmethod
+    def _propagate_to_credit_lots(code, **fields):
+        # enabled・number_of_rule3はルール計算・注文実行が個別ロット（credit_stocks）を見るため合わせて反映
+        for s in sub1.credit_stocks.get(code, []):
+            for key, value in fields.items():
+                setattr(s, key, value)
+
+    @staticmethod
+    def _market_data_looks_connected():
+        # 直近高値が全銘柄0、または全銘柄同じ値のときはRSS取得に失敗している可能性が高い
+        values = [s.recent_high for stocks in sub1.spot_stocks.values() for s in stocks]
+        values += [s.recent_high for s in sub1.credit_stocks_code.values()]
+        if not values:
+            return True
+        if all(v == 0 for v in values):
+            return False
+        if len(values) >= 2 and len(set(values)) == 1:
+            return False
+        return True
+
     # -------------------------
     # データ読み込み・表示
     # -------------------------
@@ -110,51 +141,55 @@ class TradingApp:
         self.tree.delete(*self.tree.get_children())
 
         self.tree.insert("", tk.END,
-            values=("", "【現物】", "", "", "", "", "", "", "", "", "", "", ""),
+            values=("", "【現物】", "", "", "", "", "", "", "", "", "", "", "", ""),
             tags=("header",))
 
-        for stock in sub1.spot_stocks.values():
-            iid = f"spot_{stock.code}"
-            self.data[iid] = {
-                "on": stock.enabled,
-                "code": stock.code,
-                "name": stock.name,
-                "quantity": stock.quantity,
-                "cell_quantity": stock.cell_quantity,
-                "order_suggest": stock.order_suggest,
-                "price": stock.price,
-                "recent_high": stock.recent_high,
-                "stock_type": "spot",
-                "reason": stock.sell_reason,
-                "reference_percent": stock.reference_percent,
-                "number_of_rule3": stock.number_of_rule3,
-                "get_date": stock.get_date,
-            }
-            self.tree.insert("", tk.END, iid=iid, values=(
-                "✓" if stock.enabled else "□",
-                stock.code,
-                stock.name,
-                self._fmt_date(stock.get_date, "spot"),   # #4 編集可
-                stock.price,
-                self._idx(stock.endprice, 0),
-                self._idx(stock.sma, 0),
-                stock.recent_high,
-                stock.reference_percent,
-                f"｢{stock.number_of_rule3}｣",              # #10 編集可
-                f"｢{stock.order_suggest}｣",                # #11 編集可
-                stock.sell_reason,
-                f"｢{stock.cell_quantity}｣",                # #13 編集可
-            ))
+        for stocks in sub1.spot_stocks.values():
+            for stock in stocks:
+                iid = f"spot_{stock.code}_{stock.account_class}"
+                self.data[iid] = {
+                    "on": stock.enabled,
+                    "code": stock.code,
+                    "account_class": stock.account_class,
+                    "name": stock.name,
+                    "quantity": stock.quantity,
+                    "cell_quantity": stock.cell_quantity,
+                    "order_suggest": stock.order_suggest,
+                    "price": stock.price,
+                    "recent_high": stock.recent_high,
+                    "stock_type": "spot",
+                    "reason": stock.sell_reason,
+                    "reference_percent": stock.reference_percent,
+                    "number_of_rule3": stock.number_of_rule3,
+                    "get_date": stock.get_date,
+                }
+                self.tree.insert("", tk.END, iid=iid, values=(
+                    "✓" if stock.enabled else "□",
+                    stock.code,
+                    stock.account_class,
+                    stock.name,
+                    self._fmt_date(stock.get_date, "spot"),   # #5 編集可
+                    stock.price,
+                    self._idx(stock.endprice, 0),
+                    self._idx(stock.sma, 0),
+                    stock.recent_high,
+                    f"{stock.reference_percent:.2f}",
+                    f"｢{stock.number_of_rule3}｣",              # #11 編集可
+                    f"｢{stock.order_suggest}｣",                # #12 編集可
+                    stock.sell_reason,
+                    f"｢{stock.cell_quantity}｣",                # #14 編集可
+                ))
 
         self.tree.insert("", tk.END,
-            values=("", "【信用】", "", "", "", "", "", "", "", "", "", "", ""),
+            values=("", "【信用】", "", "", "", "", "", "", "", "", "", "", "", ""),
             tags=("header",))
 
-        for stock in sub1.credit_stocks.values():
+        for stock in sub1.credit_stocks_code.values():
             iid = f"credit_{stock.code}"
             self.data[iid] = {
                 "on": stock.enabled,
                 "code": stock.code,
+                "account_class": "",
                 "name": stock.name,
                 "quantity": stock.quantity,
                 "cell_quantity": stock.cell_quantity,
@@ -170,32 +205,40 @@ class TradingApp:
             self.tree.insert("", tk.END, iid=iid, values=(
                 "✓" if stock.enabled else "□",
                 stock.code,
+                "",
                 stock.name,
-                self._fmt_date(stock.get_date, "credit"),  # #4 編集可
+                self._fmt_date(stock.get_date, "credit"),  # #5 編集可
                 stock.price,
                 self._idx(stock.endprice, 0),
                 self._idx(stock.sma, 0),
                 stock.recent_high,
-                stock.reference_percent,
-                f"｢{stock.number_of_rule3}｣",              # #10 編集可
-                f"｢{stock.order_suggest}｣",                # #11 編集可
+                f"{stock.reference_percent:.2f}",
+                f"｢{stock.number_of_rule3}｣",              # #11 編集可
+                f"｢{stock.order_suggest}｣",                # #12 編集可
                 stock.sell_reason,
-                f"｢{stock.cell_quantity}｣",                # #13 編集可
+                f"｢{stock.cell_quantity}｣",                # #14 編集可
             ))
 
     def run_analysis(self):
         self._set_status("Excelを開いています...")
         sheets = sub1.open_xlsx()
+        self.sheets = sheets
         self._set_status("現物データ取得中...")
         sub1.get_my_spot_stock(sheets["spot"])
+        # get_infoの直近高値計算で現物のget_dateを使うため、get_infoより前に現物設定を復元する
+        sub1.load_spot_settings()
         self._set_status("信用データ取得中...")
         sub1.get_my_credit_stock(sheets["credit"])
-        sub1.load_settings()
         sub1.get_info(sheets["rss_chart"], sheets["rss_sma"], self._progress_cb)
+        sub1.build_credit_stocks_code()
+        # credit_stocks_codeの作成後でないとcredit側の設定を反映できないため、get_infoの後で読み込む
+        sub1.load_credit_settings()
         self._set_status("ルール計算中...")
         sub1.calc_sell_price_basedon_rules()
         sub1.save_settings()
         self._set_status("")
+        if not self._market_data_looks_connected():
+            messagebox.showwarning("警告", "エクセルとマーケットスピードの接続を確認してください")
         self.load_data()
 
     # -------------------------
@@ -219,8 +262,12 @@ class TradingApp:
                 return
             row_data["on"] = new_value
 
-            stocks = sub1.spot_stocks if row_data["stock_type"] == "spot" else sub1.credit_stocks
-            stocks[row_data["code"]].enabled = new_value
+            stock = self._find_stock(row_data)
+            if stock is None:
+                return
+            stock.enabled = new_value
+            if row_data["stock_type"] == "credit":
+                self._propagate_to_credit_lots(row_data["code"], enabled=new_value)
             sub1.save_settings()
 
             symbol = "✓" if new_value else "□"
@@ -230,7 +277,7 @@ class TradingApp:
 
     # -------------------------
     # 編集可能セルのダブルクリック
-    # #4(取得日)  #10(高値ルール%)  #11(売却提案)  #13(売却数量)
+    # #5(取得日)  #11(高値ルール%)  #12(売却提案)  #14(売却数量)
     # 表示値は [value] 形式
     # -------------------------
     def on_double_click(self, event):
@@ -240,7 +287,7 @@ class TradingApp:
         item = sel[0]
         col = self.tree.identify_column(event.x)
 
-        if col not in ("#4", "#10", "#11", "#13"):
+        if col not in ("#5", "#11", "#12", "#14"):
             return
 
         row_data = self.data.get(item)
@@ -253,7 +300,7 @@ class TradingApp:
             raw = ""
 
         # 売却提案が「成行」のときは変更不可
-        if col == "#11" and raw == "成行":
+        if col == "#12" and raw == "成行":
             messagebox.showinfo("編集不可", "三日ルール・二日ルール適用時の成行注文は変更できません")
             return
 
@@ -266,9 +313,12 @@ class TradingApp:
             if not new_value:
                 edit_entry.destroy()
                 return
-            stocks = sub1.spot_stocks if row_data["stock_type"] == "spot" else sub1.credit_stocks
+            stock = self._find_stock(row_data)
+            if stock is None:
+                edit_entry.destroy()
+                return
 
-            if col == "#4":  # 取得日 (YYYYMMDD)
+            if col == "#5":  # 取得日 (YYYYMMDD)
                 try:
                     val = int(new_value)
                 except ValueError:
@@ -278,11 +328,11 @@ class TradingApp:
                     messagebox.showerror("入力エラー", "YYYYMMDD形式（8桁）で入力してください\n例：20260616")
                     return
                 row_data["get_date"] = val
-                stocks[row_data["code"]].get_date = val
+                stock.get_date = val
                 sub1.save_settings()
                 display = f"｢{val}｣"
 
-            elif col == "#10":  # 高値ルール%
+            elif col == "#11":  # 高値ルール%
                 try:
                     val = float(new_value)
                 except ValueError:
@@ -292,11 +342,13 @@ class TradingApp:
                     messagebox.showerror("入力エラー", "0より大きく100未満の値を入力してください")
                     return
                 row_data["number_of_rule3"] = val
-                stocks[row_data["code"]].number_of_rule3 = val
+                stock.number_of_rule3 = val
+                if row_data["stock_type"] == "credit":
+                    self._propagate_to_credit_lots(row_data["code"], number_of_rule3=val)
                 sub1.save_settings()
                 display = f"｢{val}｣"
 
-            elif col == "#11":  # 売却提案（intのみ。成行はここに到達しない）
+            elif col == "#12":  # 売却提案（intのみ。成行はここに到達しない）
                 try:
                     price = int(new_value)
                 except ValueError:
@@ -307,10 +359,13 @@ class TradingApp:
                     messagebox.showerror("入力エラー", f"呼値エラー：{price}円は無効です。\nこの価格帯の呼値は{tick}円単位です。")
                     return
                 row_data["order_suggest"] = price
-                stocks[row_data["code"]].order_suggest = price
+                stock.order_suggest = price
+                # 信用は_find_stockが集約(summary)を返すため、実発注が見る個別ロットにも伝播させる
+                if row_data["stock_type"] == "credit":
+                    self._propagate_to_credit_lots(row_data["code"], order_suggest=price)
                 display = f"｢{price}｣"
 
-            else:  # #13 売却数量
+            else:  # #14 売却数量
                 try:
                     val = int(new_value)
                 except ValueError:
@@ -323,7 +378,7 @@ class TradingApp:
                     messagebox.showerror("入力エラー", f"保有数量（{row_data['quantity']}）を超えられません")
                     return
                 row_data["cell_quantity"] = val
-                stocks[row_data["code"]].cell_quantity = val
+                stock.cell_quantity = val
                 display = f"｢{val}｣"
 
             values = list(self.tree.item(item, "values"))
@@ -407,6 +462,17 @@ class TradingApp:
             messagebox.showwarning("警告", "注文対象がありません")
             return
 
+        # 未対応の口座区分・建市場は発注前に検出して一括中止する（部分発注を防ぐ）
+        problems = sub1.validate_enabled_orders()
+        if problems:
+            messagebox.showerror(
+                "注文前チェック",
+                "以下の銘柄は口座区分／建市場が未対応のため注文できません。\n"
+                "該当銘柄をOFFにするか、データを確認してください。\n\n"
+                + "\n".join(problems)
+            )
+            return
+
         dlg = tk.Toplevel(self.root)
         dlg.title("注文確認")
         dlg.geometry("780x560")
@@ -445,13 +511,23 @@ class TradingApp:
         dlg.wait_window()
 
         if confirmed.get():
+            if self.sheets is None:
+                messagebox.showwarning("警告", "「判定実行」が行われていないため、注文を実行できません")
+                return
+
             for row in selected:
                 print(f"注文: {row['code']} {row['cell_quantity']}株 {row['order_suggest']} 理由:{row['reason']}")
-            messagebox.showinfo("完了", "注文処理（仮）完了")
+
+            success = sub1.order(self.sheets["id"], self.sheets["check_order"], self.sheets["control"])
+            if success:
+                messagebox.showinfo("完了", "注文処理が完了しました")
+            else:
+                messagebox.showerror("エラー", "注文処理でエラーが発生しました。RssOrderListシートをご確認ください")
 
 
 if __name__ == "__main__":
     root = tk.Tk()
     app = TradingApp(root)
-    root.geometry("1100x600")
+    #起動時のウィンドウサイズ
+    root.geometry("1300x650")
     root.mainloop()

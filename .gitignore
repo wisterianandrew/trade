@@ -11,3 +11,4 @@ save.json
 main.spec
 requirements.txt
 sub2.py
+*.txt
