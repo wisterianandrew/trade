@@ -628,6 +628,24 @@ def validate_enabled_orders() -> list[str]:
                 problems.append(f"信用 {s.code} {s.name}：建市場「{s.build_market}」が未対応")
     return problems
 
+# 発注直前の最終チェック：発注対象の売却数量が0でなく100の倍数か（GUI編集をすり抜けた不正値の保険）
+def validate_order_quantities() -> list[str]:
+    problems = []
+    # 現物：enabledロットのcell_quantity
+    for stocks in spot_stocks.values():
+        for s in stocks:
+            if not s.enabled:
+                continue
+            if s.cell_quantity <= 0 or s.cell_quantity % 100 != 0:
+                problems.append(f"現物 {s.code} {s.name}：売却数量 {s.cell_quantity} が不正（0でなく100の倍数が必要）")
+    # 信用：発注数量指定に使う集約(summary)のcell_quantity
+    for summary in credit_stocks_code.values():
+        if not summary.enabled:
+            continue
+        if summary.cell_quantity <= 0 or summary.cell_quantity % 100 != 0:
+            problems.append(f"信用 {summary.code} {summary.name}：売却数量 {summary.cell_quantity} が不正（0でなく100の倍数が必要）")
+    return problems
+
 #現物、ruleごとに売り（発注に使ったidを消費して次のidを返す）
 def spot_cell(ws, id, stock):
     time.sleep(0.5)

@@ -473,6 +473,17 @@ class TradingApp:
             )
             return
 
+        # 発注数量が0でなく100の倍数か最終チェック（不正値があれば一括中止）
+        qty_problems = sub1.validate_order_quantities()
+        if qty_problems:
+            messagebox.showerror(
+                "注文前チェック",
+                "以下の銘柄は発注数量が不正です（0でなく100の倍数が必要）。\n"
+                "該当銘柄の売却数量を修正してください。\n\n"
+                + "\n".join(qty_problems)
+            )
+            return
+
         dlg = tk.Toplevel(self.root)
         dlg.title("注文確認")
         dlg.geometry("780x560")
