@@ -234,7 +234,7 @@ class TradingApp:
         # credit_stocks_codeの作成後でないとcredit側の設定を反映できないため、get_infoの後で読み込む
         sub1.load_credit_settings()
         self._set_status("ルール計算中...")
-        sub1.calc_sell_price_basedon_rules()
+        sub1.calc_sell_price_basedon_rules(self.is_holiday)
         sub1.save_settings()
         self._set_status("")
         if not self._market_data_looks_connected():
@@ -438,7 +438,7 @@ class TradingApp:
                         txt.insert(tk.END, f"    直近高値 {r['recent_high']}円 の {pct}%\n", "normal")
                     txt.insert(tk.END, "    売却提案：", "normal")
                     txt.insert(tk.END, f"  {suggest}  ", "emphasis")
-                    txt.insert(tk.END, "　　売却数量：", "normal")
+                    txt.insert(tk.END, "    売却数量：", "normal")
                     txt.insert(tk.END, f"  {r['cell_quantity']}株  ", "emphasis")
                     txt.insert(tk.END, "\n\n", "normal")
 
@@ -449,9 +449,11 @@ class TradingApp:
     # -------------------------
     def execute_orders(self):
         zone = sub1._get_time_zone(sub1.datetime.now(), self.is_holiday)
+        """
         if zone == "day_off":
             messagebox.showwarning("休場日", "本日は土日・祝日のため注文できません")
             return
+        """
         if zone is None:
             messagebox.showwarning("システム対応時間外", "注文可能時間は以下の通りです\n・14:00〜15:30\n・17:00〜翌08:59")
             return

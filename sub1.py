@@ -7,7 +7,7 @@ import json
 import os
 
 test = True
-order_flag = False
+order_flag = True
 
 @dataclass
 class Stock:
@@ -257,9 +257,9 @@ def get_high_end_recent(ws, stock, my_date):
         f'{date},100)'
     )
     #エクセルに再計算をお願いする
-    ws.Application.Calculate()
+    #ws.Application.Calculate()
     # Excel/RSS更新待ち
-    time.sleep(0.5)
+    time.sleep(1)
 
     # 直近高値探索(最近の方から)
     # 実行時が購入日の時、直近高値は現在値（購入日=当日は遡る過去データが無いため）
@@ -346,9 +346,9 @@ def get_sma(ws, stock):
         f',"D",4,5)'
     )
     #エクセルに再計算をお願いする
-    ws.Application.Calculate()
+    #ws.Application.Calculate()
     # Excel/RSS更新待ち
-    time.sleep(0.5)
+    time.sleep(1)
 
     # sma取得
     row = 10
@@ -447,8 +447,12 @@ def is_valid_tick_price(price: float) -> bool:
 
 # 実行時の時間帯を把握
 def _get_time_zone(now: datetime, is_holiday: bool = False) -> str | None:
-    if now.weekday() >= 5 or is_holiday:
-        return "day_off"       # 土日または祝日
+    #if now.weekday() >= 5 or is_holiday:
+    #    return "day_off"       # 土日または祝日
+    if test:
+        print(f"isholi?={is_holiday}")
+    if is_holiday:
+        return "day_off"
     if now.hour >= 17:
         return "after_close"   # 17:00-23:59
     if now.hour <= 8:
@@ -459,11 +463,11 @@ def _get_time_zone(now: datetime, is_holiday: bool = False) -> str | None:
 
 
 # rule1, order_suggestとsell_reasonを埋める
-def rule1(stock):
+def rule1(stock,is_holiday):
     if len(stock.endprice) < 3 or len(stock.sma) < 3:
         if test: print(f"{stock.code}: データ不足でrule1スキップ")
         return
-    zone = _get_time_zone(datetime.now())
+    zone = _get_time_zone(datetime.now(),is_holiday)
     if zone is None:
         if test: print("ルール１の適用時間外")
         return
@@ -481,11 +485,11 @@ def rule1(stock):
 
 
 # rule2
-def rule2(stock):
+def rule2(stock,is_holiday):
     if len(stock.high) < 2 or len(stock.sma) < 2:
         if test: print(f"{stock.code}: データ不足でrule2スキップ")
         return
-    zone = _get_time_zone(datetime.now())
+    zone = _get_time_zone(datetime.now(),is_holiday)
     if zone is None:
         if test: print("ルール２の適用時間外")
         return
@@ -501,8 +505,8 @@ def rule2(stock):
 
 
 # rule3
-def rule3(stock):
-    zone = _get_time_zone(datetime.now())
+def rule3(stock,is_holiday):
+    zone = _get_time_zone(datetime.now(),is_holiday)
     if zone is None:
         if test: print("ルール３の適用時間外")
         return
@@ -513,19 +517,19 @@ def rule3(stock):
 
 
 #1銘柄にrule1 > rule2 > rule3の優先順でルールを適用
-def _apply_rules(stock):
-    rule1(stock)
+def _apply_rules(stock,is_holiday):
+    rule1(stock,is_holiday)
     if not stock.sell_reason == "三日ルール":
-        rule2(stock)
+        rule2(stock,is_holiday)
         if not stock.sell_reason == "二日ルール":
-            rule3(stock)
+            rule3(stock,is_holiday)
 
 #売却値段の算出、rule1 > rule2 > rule3にしてほしいみたい
-def calc_sell_price_basedon_rules():
+def calc_sell_price_basedon_rules(is_holiday: bool = False):
     # 現物・信用の個別ロット（発注はこの個別ロットのsell_reason/order_suggestを使う）
     for stocks in list(spot_stocks.values()) + list(credit_stocks.values()):
         for stock in stocks:
-            _apply_rules(stock)
+            _apply_rules(stock,is_holiday)
 
             # -------------------------
             # デバッグ表示
@@ -539,7 +543,7 @@ def calc_sell_price_basedon_rules():
     # 信用の集約（GUI表示・注文確認ダイアログはこの集約側を参照するため同じルールを適用）
     # 同一codeのロットは入力値が同一なので、個別ロットと同じ結果になる
     for stock in credit_stocks_code.values():
-        _apply_rules(stock)
+        _apply_rules(stock,is_holiday)
         if test:
             print(
                 f"[集約] {stock.code} "
@@ -568,28 +572,34 @@ def _normalize_code(value) -> str:
     except (TypeError, ValueError):
         return str(value).strip()
 
-# 執行中銘柄達の取得
+# 執行中/待機中銘柄達の取得
 def get_executing_stocks(ws) -> list[int]:
     list = []
     # 3行目から読む
     row = 3
     while True:
         state1 = ws.Range(f"C{row}").Value
+        state2 = ws.Range(f"D{row}").Value
+        v = ws.Range(f"A{row}").Value
         # 空セルまたは区切り行で終了
-        if state1 is None or (isinstance(state1,str) and "-" in state1):
+        if v is None or (isinstance(v,str) and "-" in v):
             break
         code = _normalize_code(ws.Range(f"F{row}").Value)
         enabled = (any(s.enabled for s in spot_stocks.get(code, [])) or
                    any(s.enabled for s in credit_stocks.get(code, [])))
-        if state1 == "執行中" and enabled:
+        if test:
+            print(f"enable? = {enabled}")
+        if (state1 == "執行中" or state2 == "待機中") and enabled:
             list.append(int(ws.Range(f"A{row}").Value))
         row += 1
+    if test:
+        print(f"執行中/待機中:{list}")
     return list
 
 #キャンセル注文（次のidを返す）
 def cancel(ws,id,list):
     for order_id in list:
-        time.sleep(0.5)
+        time.sleep(1)
         ws.Range(f"A1").Value = (
             f'=RssCancelOrder('
             f'{id},{order_flag},{order_id})'
@@ -597,13 +607,13 @@ def cancel(ws,id,list):
         id += 1
 
     #　注文関数はエクセルに残らないようにする（次回起動時のバグのもと）
-    ws.Range(f"A1").Value = None
+    #ws.Range(f"A1").Value = None
     return id
 
 def cancel_order(ws_id, ws_check, ws_order):
     # 取り消し注文入力に使うidを取得
     id = get_proper_id(ws_id)
-    # 執行中　かつ　取引に出そうとしている銘柄 の注文番号を取得
+    # 執行中/待機中　かつ　取引に出そうとしている銘柄 の注文番号を取得
     executing_list = get_executing_stocks(ws_check)
     # id executing_listから取り消し注文（消費後の次のidを返す）
     return cancel(ws_order,id,executing_list)
@@ -648,7 +658,7 @@ def validate_order_quantities() -> list[str]:
 
 #現物、ruleごとに売り（発注に使ったidを消費して次のidを返す）
 def spot_cell(ws, id, stock):
-    time.sleep(0.5)
+    time.sleep(1)
     cla = _ACCOUNT_CLASS_MAP.get(stock.account_class, -1)
 
     if stock.sell_reason == "三日ルール" or stock.sell_reason == "二日ルール":
@@ -659,6 +669,8 @@ def spot_cell(ws, id, stock):
             f',0,,2,,{cla})'
         )
     elif stock.sell_reason == "高値ルール":
+        #土日（祝）以外のdateを求める必要あり
+        """
         date = (datetime.today()
             + timedelta(days=20)
             ).strftime("%Y%m%d")
@@ -667,12 +679,18 @@ def spot_cell(ws, id, stock):
             f'{id},{order_flag},{stock.code},1,2,1,{stock.cell_quantity}'
             f',,,5,{date},{cla},{stock.order_suggest},2,0)'
         )
+        """
+        ws.Range(f"A1").Value = (
+                    f'=RssStockOrder('
+                    f'{id},{order_flag},{stock.code},1,2,1,{stock.cell_quantity}'
+                    f',,,2,,{cla},{stock.order_suggest},2,0)'
+                )
     id += 1
     return id
 
 #信用、ruleごとに売り（qtyは呼び出し側でcredit_stocks_codeの残数量に合わせてクランプ済み）
 def credit_cell(ws, id, stock, qty):
-    time.sleep(0.5)
+    time.sleep(1)
     mar = _BUILD_MARKET_MAP.get(stock.build_market, -1)
     pri = stock.build_price
     get = stock.get_date
@@ -683,6 +701,8 @@ def credit_cell(ws, id, stock, qty):
             f',0,,2,,0,{get},{pri},{mar})'
         )
     elif stock.sell_reason == "高値ルール":
+        #土日（祝）以外のdateを求める必要あり
+        """
         date = (datetime.today()
             + timedelta(days=20)
             ).strftime("%Y%m%d")
@@ -691,6 +711,12 @@ def credit_cell(ws, id, stock, qty):
             f'{id},{order_flag},{stock.code},1,2,1,2,{qty}'
             f',,,5,{date},0,{get},{pri},{mar},{stock.order_suggest},2,0)'
         )
+        """
+        ws.Range(f"A1").Value = (
+                    f'=RssMarginCloseOrder('
+                    f'{id},{order_flag},{stock.code},1,2,1,2,{qty}'
+                    f',,,2,,0,{get},{pri},{mar},{stock.order_suggest},2,0)'
+                )
 
     id += 1
     return id
@@ -717,7 +743,7 @@ def cell_order(ws_id, ws_order, id=None):
             id = credit_cell(ws_order, id, stock, qty)
             remaining -= qty
     # 注文関数はエクセルに残さない
-    ws_order.Range(f"A1").Value = None
+    #ws_order.Range(f"A1").Value = None
     return id
     
 
@@ -728,7 +754,7 @@ def check_order(ws) -> bool:
         v = ws.Range(f"F{row}").value
         if v is None or (isinstance(v,str) and "-" in v):
             break
-        if "エラー" in v:
+        if isinstance(v,str) and "エラー" in v:
             return False
         row += 1
     return True
