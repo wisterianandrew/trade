@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import win32com.client
+import pywintypes
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
 import time
@@ -8,6 +9,50 @@ import os
 
 test = True
 order_flag = True
+
+# Excelが他のCOM呼び出し（RSSアドインの内部処理など）でビジーな間、
+# 外部からのCOM呼び出しをRPC_E_CALL_REJECTEDで一時的に拒否することがある。
+# このエラーの時だけ短い待機を挟んでリトライする（他のCOMエラーはそのまま送出）。
+_RPC_E_CALL_REJECTED = -2147418111
+
+def _com_retry(func, retries=10, delay=0.3):
+    for attempt in range(retries):
+        try:
+            return func()
+        except pywintypes.com_error as e:
+            if e.args[0] == _RPC_E_CALL_REJECTED and attempt < retries - 1:
+                time.sleep(delay)
+                continue
+            raise
+
+# セル値の読み取り・書き込みは全てこのヘルパー経由にする（ビジー時の自動リトライを効かせるため）
+def _get_value(ws, cell):
+    return _com_retry(lambda: ws.Range(cell).Value)
+
+def _set_value(ws, cell, value):
+    def _do():
+        ws.Range(cell).Value = value
+    _com_retry(_do)
+
+# RSS関数を書き込んだセルは、処理中の間 "数式 => 応答待ち" のようにステータスが付与される。
+# ステータス文言（"=>"の後ろ）を取り出す。"=>"が無ければ空文字（未処理中とみなす）。
+_RSS_PENDING_STATUS = "応答待ち"
+
+def _rss_status(ws, cell) -> str:
+    text = str(_get_value(ws, cell))
+    return text.rsplit("=>", 1)[-1].strip() if "=>" in text else ""
+
+# RSS関数の応答完了を待つ。ステータスが"応答待ち"の間だけポーリングし、
+# timeout秒経っても終わらない場合は諦めて戻る（下流はデータ不足時に各ルールをスキップする作りなので安全側）
+def _wait_for_rss(ws, cell, timeout=10.0, interval=0.2):
+    elapsed = 0.0
+    while _rss_status(ws, cell) == _RSS_PENDING_STATUS:
+        if elapsed >= timeout:
+            if test:
+                print(f"RSS応答待ちがtimeout({timeout}s)に達しました: {cell}")
+            break
+        time.sleep(interval)
+        elapsed += interval
 
 @dataclass
 class Stock:
@@ -139,7 +184,7 @@ def get_my_spot_stock(ws):
     # 3行目から読む（1,2行目はヘッダー）
     row = 3
     while True:
-        code = ws.Range(f"A{row}").Value
+        code = _get_value(ws, f"A{row}")
         # 空セルまたは区切り行で終了
         if code is None or (isinstance(code,str) and "-" in code):
             break
@@ -149,13 +194,13 @@ def get_my_spot_stock(ws):
 
             row += 1
             continue
-        
-        code = int(code)
-        name = ws.Range(f"B{row}").Value
-        quantity = ws.Range(f"D{row}").Value
-        price = ws.Range(f"G{row}").Value
 
-        account_class = ws.Range(f"C{row}").Value
+        code = int(code)
+        name = _get_value(ws, f"B{row}")
+        quantity = _get_value(ws, f"D{row}")
+        price = _get_value(ws, f"G{row}")
+
+        account_class = _get_value(ws, f"C{row}")
 
         # Stock型のstockを作る
         stock = Stock(
@@ -191,7 +236,7 @@ def get_my_credit_stock(ws):
     # 3行目から読む
     row = 3
     while True:
-        code = ws.Range(f"A{row}").Value
+        code = _get_value(ws, f"A{row}")
         # 空セルまたは区切り行で終了
         if code is None or (isinstance(code,str) and "-" in code):
             break
@@ -203,13 +248,13 @@ def get_my_credit_stock(ws):
             continue
 
         code = int(code)
-        name = ws.Range(f"B{row}").Value
-        quantity = ws.Range(f"H{row}").Value
-        price = ws.Range(f"M{row}").Value
+        name = _get_value(ws, f"B{row}")
+        quantity = _get_value(ws, f"H{row}")
+        price = _get_value(ws, f"M{row}")
 
-        build_market = ws.Range(f"D{row}").Value
-        build_price = ws.Range(f"J{row}").Value
-        get_date = ws.Range(f"K{row}").Value
+        build_market = _get_value(ws, f"D{row}")
+        build_price = _get_value(ws, f"J{row}")
+        get_date = _get_value(ws, f"K{row}")
 
         # credit_stocksの中に同じcodeに対応するstockが既にあるかも（建日違いなど）→listで保持
         stock = Stock(
@@ -251,35 +296,45 @@ def get_high_end_recent(ws, stock, my_date):
     target_cell = "A1"
     
     # RSS関数を書き込み
-    ws.Range(target_cell).Value = (
+    _set_value(ws, target_cell, (
         f'=RssChartPast($A$2:$J$2,'
         f'{stock.code},"D",'
         f'{date},100)'
-    )
+    ))
     #エクセルに再計算をお願いする
     #ws.Application.Calculate()
-    # Excel/RSS更新待ち
-    time.sleep(1)
+    # RSS更新待ち（"応答待ち"の間だけポーリング）
+    _wait_for_rss(ws, target_cell)
 
     # 直近高値探索(最近の方から)
+    row = 3
+    while(True):
+        value = str(_get_value(ws, f"D{row}"))
+        if value == "None" or "-" in value:
+            break
+        row += 1
+    last = row-1
+
     # 実行時が購入日の時、直近高値は現在値（購入日=当日は遡る過去データが無いため）
     # my_dateはint(YYYYMMDD)なので、todayも同じ形式に揃えて比較する
     today_int = int(datetime.today().strftime("%Y%m%d"))
     if my_date == today_int:
         stock.recent_high = stock.price
     else:
-        row = 30 
+        row = last
         max_high = 0
         while (row >= 3):
-            value1 = str(ws.Range(f"F{row}").Value)
-            value2 = str(ws.Range(f"I{row}").Value)
-            # 区切り行までスキップ（一見問題ありな実装だがrssの仕様上OK！）
+            value1 = str(_get_value(ws, f"F{row}"))
+            value2 = str(_get_value(ws, f"I{row}"))
+            # 区切り行までスキップ（一見問題ありな実装だがrssの仕様上OK！）=> やっぱダメそうなので直した
             if value1 == "None" or "-" in value1:
                 row -= 1
+                if test: 
+                    print(f"探索開始位置に問題あり")
                 continue
-            
+
             # 購入日以前にはもどらないようにする
-            if(my_date > int((ws.Range(f"D{row}").Value).replace("/", ""))):
+            if(my_date > int(_get_value(ws, f"D{row}").replace("/", ""))):
                 break
 
             # strなのでcastしてあげよう
@@ -301,14 +356,14 @@ def get_high_end_recent(ws, stock, my_date):
     small_all = []
     start_all = []
     percent_all = []
-    row = 30
+    row = last
     # 一旦全部取得して
     while (row>=3):
-        value1 = str(ws.Range(f"G{row}").Value)
-        value2 = str(ws.Range(f"I{row}").Value)
-        value3 = str(ws.Range(f"F{row}").Value)
-        value4 = str(ws.Range(f"H{row}").Value)
-        # 区切り行までスキップ（一見問題ありな実装だがrssの仕様上OK！）
+        value1 = str(_get_value(ws, f"G{row}"))
+        value2 = str(_get_value(ws, f"I{row}"))
+        value3 = str(_get_value(ws, f"F{row}"))
+        value4 = str(_get_value(ws, f"H{row}"))
+        # 区切り行までスキップ（一見問題ありな実装だがrssの仕様上OK！）=> やっぱダメそうなので直した
         if value1 == "None" or "-" in value1:
             row -= 1
             continue
@@ -340,21 +395,21 @@ def get_high_end_recent(ws, stock, my_date):
 # 必要になった関数2(sma取得)
 def get_sma(ws, stock):
     target_cell = "A1"
-    ws.Range(target_cell).Value = (
+    _set_value(ws, target_cell, (
         f'=RssTrendSMA($A$2:$L$2,'
         f'{stock.code}'
         f',"D",4,5)'
-    )
+    ))
     #エクセルに再計算をお願いする
     #ws.Application.Calculate()
-    # Excel/RSS更新待ち
-    time.sleep(1)
+    # RSS更新待ち（"応答待ち"の間だけポーリング）
+    _wait_for_rss(ws, target_cell)
 
     # sma取得
     row = 10
     sma_all = []
     while (row >= 3):
-        value = str(ws.Range(f"F{row}").Value)
+        value = str(_get_value(ws, f"F{row}"))
         # 区切り行までスキップ（一見問題ありな実装だがrssの仕様上OK！）
         if value == "None" or "-" in value:
             row -= 1
@@ -447,12 +502,8 @@ def is_valid_tick_price(price: float) -> bool:
 
 # 実行時の時間帯を把握
 def _get_time_zone(now: datetime, is_holiday: bool = False) -> str | None:
-    #if now.weekday() >= 5 or is_holiday:
-    #    return "day_off"       # 土日または祝日
-    if test:
-        print(f"isholi?={is_holiday}")
-    if is_holiday:
-        return "day_off"
+    if now.weekday() >= 5 or is_holiday:
+        return "day_off"       # 土日または祝日
     if now.hour >= 17:
         return "after_close"   # 17:00-23:59
     if now.hour <= 8:
@@ -460,7 +511,6 @@ def _get_time_zone(now: datetime, is_holiday: bool = False) -> str | None:
     if now.hour == 14 or (now.hour == 15 and now.minute <= 30):
         return "closing"       # 14:00-15:30
     return None
-
 
 # rule1, order_suggestとsell_reasonを埋める
 def rule1(stock,is_holiday):
@@ -483,7 +533,6 @@ def rule1(stock,is_holiday):
         stock.order_suggest = "成行"
         stock.sell_reason = "三日ルール"
 
-
 # rule2
 def rule2(stock,is_holiday):
     if len(stock.high) < 2 or len(stock.sma) < 2:
@@ -503,7 +552,6 @@ def rule2(stock,is_holiday):
         stock.order_suggest = "成行"
         stock.sell_reason = "二日ルール"
 
-
 # rule3
 def rule3(stock,is_holiday):
     zone = _get_time_zone(datetime.now(),is_holiday)
@@ -514,7 +562,6 @@ def rule3(stock,is_holiday):
         raw = stock.recent_high * (100 - stock.number_of_rule3) / 100
         stock.order_suggest = floor_to_tick(raw)
         stock.sell_reason = "高値ルール"
-
 
 #1銘柄にrule1 > rule2 > rule3の優先順でルールを適用
 def _apply_rules(stock,is_holiday):
@@ -556,7 +603,7 @@ def get_proper_id(ws) -> int:
     # 3行目から読む
     row = 3
     while True:
-        number = ws.Range(f"A{row}").Value
+        number = _get_value(ws, f"A{row}")
         # 空セルまたは区切り行で終了
         if number is None or (isinstance(number,str) and "-" in number):
             break
@@ -578,19 +625,19 @@ def get_executing_stocks(ws) -> list[int]:
     # 3行目から読む
     row = 3
     while True:
-        state1 = ws.Range(f"C{row}").Value
-        state2 = ws.Range(f"D{row}").Value
-        v = ws.Range(f"A{row}").Value
+        state1 = _get_value(ws, f"C{row}")
+        state2 = _get_value(ws, f"D{row}")
+        v = _get_value(ws, f"A{row}")
         # 空セルまたは区切り行で終了
         if v is None or (isinstance(v,str) and "-" in v):
             break
-        code = _normalize_code(ws.Range(f"F{row}").Value)
+        code = _normalize_code(_get_value(ws, f"F{row}"))
         enabled = (any(s.enabled for s in spot_stocks.get(code, [])) or
                    any(s.enabled for s in credit_stocks.get(code, [])))
         if test:
             print(f"enable? = {enabled}")
         if (state1 == "執行中" or state2 == "待機中") and enabled:
-            list.append(int(ws.Range(f"A{row}").Value))
+            list.append(int(_get_value(ws, f"A{row}")))
         row += 1
     if test:
         print(f"執行中/待機中:{list}")
@@ -600,14 +647,16 @@ def get_executing_stocks(ws) -> list[int]:
 def cancel(ws,id,list):
     for order_id in list:
         time.sleep(1)
-        ws.Range(f"A1").Value = (
+        _set_value(ws, "A1", (
             f'=RssCancelOrder('
             f'{id},{order_flag},{order_id})'
-        )
+        ))
+        _wait_for_rss(ws, "A1")
         id += 1
 
     #　注文関数はエクセルに残らないようにする（次回起動時のバグのもと）
-    #ws.Range(f"A1").Value = None
+    time.sleep(1)
+    ws.Range(f"A1").Value = None
     return id
 
 def cancel_order(ws_id, ws_check, ws_order):
@@ -663,11 +712,12 @@ def spot_cell(ws, id, stock):
 
     if stock.sell_reason == "三日ルール" or stock.sell_reason == "二日ルール":
         #zoneで変わるかと思ったが、期間指定のところを今週中にしたので、同じ注文でよくなった。
-        ws.Range(f"A1").Value = (
+        _set_value(ws, "A1", (
             f'=RssStockOrder('
             f'{id},{order_flag},{stock.code},1,0,1,{stock.cell_quantity}'
             f',0,,2,,{cla})'
-        )
+        ))
+        _wait_for_rss(ws, "A1")
     elif stock.sell_reason == "高値ルール":
         #土日（祝）以外のdateを求める必要あり
         """
@@ -680,11 +730,12 @@ def spot_cell(ws, id, stock):
             f',,,5,{date},{cla},{stock.order_suggest},2,0)'
         )
         """
-        ws.Range(f"A1").Value = (
+        _set_value(ws, "A1", (
                     f'=RssStockOrder('
                     f'{id},{order_flag},{stock.code},1,2,1,{stock.cell_quantity}'
                     f',,,2,,{cla},{stock.order_suggest},2,0)'
-                )
+                ))
+        _wait_for_rss(ws, "A1")
     id += 1
     return id
 
@@ -695,11 +746,12 @@ def credit_cell(ws, id, stock, qty):
     pri = stock.build_price
     get = stock.get_date
     if stock.sell_reason == "三日ルール" or stock.sell_reason == "二日ルール":
-        ws.Range(f"A1").Value = (
+        _set_value(ws, "A1", (
             f'=RssMarginCloseOrder('
             f'{id},{order_flag},{stock.code},1,0,1,2,{qty}'
             f',0,,2,,0,{get},{pri},{mar})'
-        )
+        ))
+        _wait_for_rss(ws, "A1")
     elif stock.sell_reason == "高値ルール":
         #土日（祝）以外のdateを求める必要あり
         """
@@ -712,11 +764,12 @@ def credit_cell(ws, id, stock, qty):
             f',,,5,{date},0,{get},{pri},{mar},{stock.order_suggest},2,0)'
         )
         """
-        ws.Range(f"A1").Value = (
+        _set_value(ws, "A1", (
                     f'=RssMarginCloseOrder('
                     f'{id},{order_flag},{stock.code},1,2,1,2,{qty}'
                     f',,,2,,0,{get},{pri},{mar},{stock.order_suggest},2,0)'
-                )
+                ))
+        _wait_for_rss(ws, "A1")
 
     id += 1
     return id
@@ -743,23 +796,21 @@ def cell_order(ws_id, ws_order, id=None):
             id = credit_cell(ws_order, id, stock, qty)
             remaining -= qty
     # 注文関数はエクセルに残さない
-    #ws_order.Range(f"A1").Value = None
+    time.sleep(1)
+    ws_order.Range(f"A1").Value = None
     return id
-    
 
 def check_order(ws) -> bool:
     row = 3
     while(True):
         # 空セルまたは区切り行で終了
-        v = ws.Range(f"F{row}").value
+        v = _get_value(ws, f"F{row}")
         if v is None or (isinstance(v,str) and "-" in v):
             break
         if isinstance(v,str) and "エラー" in v:
             return False
         row += 1
     return True
-
-
 
 def order(ws_id, ws_check, ws_order) -> bool:
     #執行中の注文を全取り消し（消費後の次のidを受け取る）
@@ -768,8 +819,6 @@ def order(ws_id, ws_check, ws_order) -> bool:
     cell_order(ws_id, ws_order, next_id)
     #注文後の確認(完了画面用)
     return check_order(ws_check)
-
-
 
 if __name__ == "__main__":
     print("semi_auto trading system started!")
@@ -785,4 +834,4 @@ if __name__ == "__main__":
         # credit_stocks_codeの作成後でないとcredit側の設定を反映できないため、get_infoの後で読み込む
         load_credit_settings()
         calc_sell_price_basedon_rules()
-        order(sheet["id"], sheet["check_order"], sheet["control"])
+        #order(sheet["id"], sheet["check_order"], sheet["control"])
